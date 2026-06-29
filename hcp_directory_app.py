@@ -278,7 +278,6 @@ def render_affiliations(npi: str) -> None:
             for column in display_columns
         }
     )
-    st.caption(f"Source: {source_file}")
     st.dataframe(display_df, width="stretch", hide_index=True)
 
 
