@@ -9,7 +9,7 @@ import streamlit as st
 
 NPI_API_URL = "https://npiregistry.cms.hhs.gov/api/"
 ESTIMATE_SERVICE_URL = "https://api.openai.com/v1/responses"
-DEFAULT_ESTIMATE_MODEL = "gpt-4.1-mini"
+DEFAULT_ESTIMATE_MODEL = "gpt-5.4-nano"
 
 
 st.set_page_config(
@@ -412,7 +412,7 @@ def render_hcp_details(result: dict[str, Any]) -> None:
         st.dataframe(pd.DataFrame(name_rows), width="stretch")
 
     st.markdown("**Patient Volume Estimate**")
-    st.caption("Powered by gpt-4.1-mini")
+    st.caption("Powered by gpt-5.4-nano")
     api_key = get_secret_value("OPENAI_API_KEY")
     model = get_secret_value("OPENAI_MODEL") or DEFAULT_ESTIMATE_MODEL
     estimate_key = f"patient_volume_estimate_{summary['NPI']}"
