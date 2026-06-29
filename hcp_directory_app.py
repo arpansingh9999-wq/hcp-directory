@@ -1,6 +1,9 @@
 import os
 import re
+import zipfile
+from pathlib import Path
 from typing import Any
+import xml.etree.ElementTree as ET
 
 import pandas as pd
 import requests
@@ -9,7 +12,29 @@ import streamlit as st
 
 NPI_API_URL = "https://npiregistry.cms.hhs.gov/api/"
 ESTIMATE_SERVICE_URL = "https://api.openai.com/v1/responses"
-DEFAULT_ESTIMATE_MODEL = "gpt-5.4-nano"
+DEFAULT_ESTIMATE_MODEL = "gpt-4.1-mini"
+AFFILIATION_FILE_NAMES = (
+    "cms.cms_hospital_master_ccn.xlsx",
+    "affiliations.xlsx",
+    "affiliations.xls",
+    "affiliations.csv",
+    "affiliation_data.xlsx",
+    "affiliation_data.xls",
+    "affiliation_data.csv",
+    "hospital_affiliations.xlsx",
+    "hospital_affiliations.xls",
+    "hospital_affiliations.csv",
+)
+AFFILIATION_FILE_STEMS = ("affiliations", "affiliation_data", "hospital_affiliations")
+AFFILIATION_DISPLAY_COLUMNS = {
+    "affiliated_hospital": "Affiliated Hospital",
+    "hospital_address": "Hospital Address",
+    "hospital_city": "Hospital City",
+    "hospital_state": "Hospital State",
+    "hospital_zip_code": "Hospital Zip Code",
+    "hospital_phone_number": "Hospital Phone Number",
+    "hospital_type": "Hospital Type",
+}
 
 
 st.set_page_config(
@@ -93,6 +118,168 @@ def get_secret_value(name: str) -> str:
     except Exception:
         value = ""
     return str(value).strip() or os.getenv(name, "").strip()
+
+
+def normalize_column_name(column_name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", column_name.lower()).strip("_")
+
+
+def find_column(columns: list[str], candidates: tuple[str, ...]) -> str | None:
+    normalized_columns = {normalize_column_name(column): column for column in columns}
+    for candidate in candidates:
+        if candidate in normalized_columns:
+            return normalized_columns[candidate]
+    return None
+
+
+def find_affiliation_file() -> Path | None:
+    app_dir = Path(__file__).resolve().parent
+    search_dirs = (
+        app_dir,
+        app_dir / "Excel",
+        app_dir.parent / "Excel",
+        app_dir.parent.parent / "Excel",
+    )
+    for search_dir in search_dirs:
+        for filename in AFFILIATION_FILE_NAMES:
+            candidate = search_dir / filename
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def excel_column_index(cell_reference: str) -> int:
+    letters = "".join(character for character in cell_reference if character.isalpha())
+    index = 0
+    for letter in letters:
+        index = index * 26 + ord(letter.upper()) - ord("A") + 1
+    return index - 1
+
+
+def read_xlsx_with_stdlib(file_path: Path) -> pd.DataFrame:
+    namespace = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    with zipfile.ZipFile(file_path) as workbook:
+        shared_strings = []
+        if "xl/sharedStrings.xml" in workbook.namelist():
+            shared_root = ET.fromstring(workbook.read("xl/sharedStrings.xml"))
+            for shared_item in shared_root.findall("a:si", namespace):
+                shared_strings.append(
+                    "".join(
+                        text_node.text or ""
+                        for text_node in shared_item.findall(".//a:t", namespace)
+                    )
+                )
+
+        sheet_root = ET.fromstring(workbook.read("xl/worksheets/sheet1.xml"))
+        rows = []
+        for row in sheet_root.findall(".//a:sheetData/a:row", namespace):
+            values = []
+            for cell in row.findall("a:c", namespace):
+                cell_index = excel_column_index(cell.attrib.get("r", "A1"))
+                while len(values) <= cell_index:
+                    values.append("")
+
+                value_node = cell.find("a:v", namespace)
+                inline_node = cell.find("a:is/a:t", namespace)
+                if cell.attrib.get("t") == "s" and value_node is not None:
+                    values[cell_index] = shared_strings[int(value_node.text)]
+                elif inline_node is not None:
+                    values[cell_index] = inline_node.text or ""
+                elif value_node is not None:
+                    values[cell_index] = value_node.text or ""
+            rows.append(values)
+
+    if not rows:
+        return pd.DataFrame()
+
+    headers = [str(header).strip() for header in rows[0]]
+    data_rows = []
+    for row in rows[1:]:
+        padded_row = row + [""] * (len(headers) - len(row))
+        data_rows.append(padded_row[: len(headers)])
+    return pd.DataFrame(data_rows, columns=headers)
+
+
+def read_affiliation_file(file_path: Path) -> pd.DataFrame:
+    if file_path.suffix.lower() == ".csv":
+        return pd.read_csv(file_path, dtype=str)
+    try:
+        return pd.read_excel(file_path, dtype=str)
+    except ImportError:
+        if file_path.suffix.lower() == ".xlsx":
+            return read_xlsx_with_stdlib(file_path)
+        raise
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_affiliation_data() -> tuple[pd.DataFrame, str, list[str], str]:
+    file_path = find_affiliation_file()
+    if not file_path:
+        return pd.DataFrame(), "", [], ""
+
+    df = read_affiliation_file(file_path)
+    df = df.fillna("")
+    df.columns = [str(column).strip() for column in df.columns]
+
+    npi_column = find_column(
+        list(df.columns),
+        (
+            "npi",
+            "npi_number",
+            "provider_npi",
+            "hcp_npi",
+            "national_provider_identifier",
+        ),
+    )
+    if not npi_column:
+        raise ValueError("Could not find an NPI column in the backend affiliation file.")
+
+    display_columns = []
+    normalized_columns = {normalize_column_name(column): column for column in df.columns}
+    for normalized_name in AFFILIATION_DISPLAY_COLUMNS:
+        column = normalized_columns.get(normalized_name)
+        if column:
+            display_columns.append(column)
+
+    df["_npi_clean"] = df[npi_column].astype(str).map(clean_npi)
+    return df, npi_column, display_columns, file_path.name
+
+
+def render_affiliations(npi: str) -> None:
+    st.markdown("**Affiliations**")
+
+    try:
+        affiliation_df, _, display_columns, source_file = load_affiliation_data()
+    except ValueError as exc:
+        st.warning(str(exc))
+        return
+
+    if affiliation_df.empty:
+        st.info(
+            "No backend affiliation file found. Add cms.cms_hospital_master_ccn.xlsx "
+            "to the app folder or an Excel folder."
+        )
+        return
+
+    matches = affiliation_df[affiliation_df["_npi_clean"] == clean_npi(npi)].copy()
+    if matches.empty:
+        st.info("No affiliations found for this NPI in the backend affiliation file.")
+        return
+
+    if not display_columns:
+        st.warning(
+            "Affiliation file was found, but expected hospital columns were not found."
+        )
+        return
+
+    display_df = matches[display_columns].rename(
+        columns={
+            column: AFFILIATION_DISPLAY_COLUMNS.get(normalize_column_name(column), column)
+            for column in display_columns
+        }
+    )
+    st.caption(f"Source: {source_file}")
+    st.dataframe(display_df, width="stretch", hide_index=True)
 
 
 def extract_response_text(data: dict[str, Any]) -> str:
@@ -411,8 +598,10 @@ def render_hcp_details(result: dict[str, Any]) -> None:
         ]
         st.dataframe(pd.DataFrame(name_rows), width="stretch")
 
+    render_affiliations(summary["NPI"])
+
     st.markdown("**Patient Volume Estimate**")
-    st.caption("Powered by gpt-5.4-nano")
+    st.caption("Powered by gpt-4.1-mini")
     api_key = get_secret_value("OPENAI_API_KEY")
     model = get_secret_value("OPENAI_MODEL") or DEFAULT_ESTIMATE_MODEL
     estimate_key = f"patient_volume_estimate_{summary['NPI']}"
